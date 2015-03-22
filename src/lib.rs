@@ -291,6 +291,17 @@ pub struct Image {
     data: Vec<Pixel>
 }
 
+pub struct BitonalImage {
+    magic: BmpId,
+    header: BmpHeader,
+    dib_header: BmpDibHeader,
+    color_palette: Option<Vec<Pixel>>,
+    width: u32,
+    height: u32,
+    padding: u32,
+    data: BitVec
+}
+
 impl fmt::Debug for Image {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         try!(write!(f, "Image {}\n", '{'));
@@ -468,6 +479,81 @@ impl Image {
     }
 }
 
+impl BitonalImage {
+    /// Returns a new BMP Image with the `width` and `height` specified. It is initialized to
+    /// a black image by default.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// extern crate bmp;
+    ///
+    /// let mut img = bmp::Image::new(100, 80);
+    /// ```
+    pub fn new(width: u32, height: u32) -> BitonalImage {
+        let mut data = BitVec::with_capacity((width * height) as usize);
+        for _ in 0 .. width * height {
+            data.push(false);
+        }
+
+        let (header_size, data_size) = file_size!(1, width, height);
+        BitonalImage {
+            magic: BmpId::new(),
+            header: BmpHeader::new(header_size, data_size),
+            dib_header: BmpDibHeader::new(width as i32, height as i32),
+            color_palette: None,
+            width: width,
+            height: height,
+            padding: width % 4,
+            data: data
+        }
+    }
+
+    /// Returns the `width` of the Image.
+    #[inline]
+    pub fn get_width(&self) -> u32 {
+        self.width
+    }
+
+    /// Returns the `height` of the Image.
+    #[inline]
+    pub fn get_height(&self) -> u32 {
+        self.height
+    }
+
+    /// Returns the pixel value at the position of `width` and `height`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// extern crate bmp;
+    ///
+    /// let img = bmp::Image::new(100, 80);
+    /// assert_eq!(bmp::consts::BLACK, img.get_pixel(10, 10));
+    /// ```
+    #[inline]
+    pub fn get_pixel(&self, x: u32, y: u32) -> bool {
+        self.data[((self.height - y - 1) * self.width + x) as usize]
+    }
+
+    /// Returns a new `ImageIndex` that iterates over the image dimensions in top-bottom order.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// extern crate bmp;
+    ///
+    /// let mut img = bmp::Image::new(100, 100);
+    /// for (x, y) in img.coordinates() {
+    ///     img.set_pixel(x, y, bmp::consts::BLUE);
+    /// }
+    /// ```
+    #[inline]
+    pub fn coordinates(&self) -> ImageIndex {
+        ImageIndex::new(self.width as u32, self.height as u32)
+    }
+}
+
 /// Returns a `BmpResult`, either containing an `Image` or a `BmpError`.
 ///
 /// # Example
@@ -506,6 +592,46 @@ pub fn open(name: &str) -> BmpResult<Image> {
     };
 
     let image = Image {
+        magic: id,
+        header: header,
+        dib_header: dib_header,
+        color_palette: color_palette,
+        width: width,
+        height: height,
+        padding: padding,
+        data: data
+    };
+
+    Ok(image)
+}
+
+pub fn open_bitonal(name: &str) -> BmpResult<BitonalImage> {
+    let mut bytes = Vec::new();
+    let mut f = try!(fs::File::open(name));
+    try!(f.read_to_end(&mut bytes));
+    let mut bmp_data = Cursor::new(bytes);
+
+    let id = try!(read_bmp_id(&mut bmp_data));
+    let header = try!(read_bmp_header(&mut bmp_data));
+    let dib_header = try!(read_bmp_dib_header(&mut bmp_data));
+
+    let color_palette = try!(read_color_palette(&mut bmp_data, &dib_header));
+
+    let width = dib_header.width.abs() as u32;
+    let height = dib_header.height.abs() as u32;
+    let padding = width % 4;
+
+    let data = match color_palette {
+        Some(ref palette) => try!(
+            read_indexes_bitonal(&mut bmp_data.into_inner(), &palette, width as usize, height as usize,
+                         dib_header.bits_per_pixel, header.pixel_offset as usize)
+        ),
+        None => try!(
+            read_pixels_bitonal(&mut bmp_data, width, height, header.pixel_offset, padding as i64)
+        )
+    };
+
+    let image = BitonalImage {
         magic: id,
         header: header,
         dib_header: dib_header,
@@ -655,6 +781,63 @@ fn read_indexes(bmp_data: &mut Vec<u8>, palette: &Vec<Pixel>,
     Ok(data)
 }
 
+fn read_indexes_bitonal(bmp_data: &mut Vec<u8>, palette: &Vec<Pixel>,
+                width: usize, height: usize, bpp: u16, offset: usize) -> BmpResult<BitVec> {
+    let threshold = 0x7f;
+    let mut data = BitVec::with_capacity(height * width);
+    // Number of bytes to read from each row, varies based on bits_per_pixel
+    let bytes_per_row = Float::ceil(width as f64 / (8.0 / bpp as f64)) as usize;
+    for y in 0 .. height {
+        let padding = match bytes_per_row % 4 {
+            0 => 0,
+            other => 4 - other
+        };
+        let start = offset + (bytes_per_row + padding) * y;
+        let bytes = &bmp_data[start .. start + bytes_per_row];
+
+        // determine how to parse each row, depending on bits_per_pixel
+        match bpp {
+            1 => {
+                let bits = BitVec::from_bytes(&bytes[..]);
+                for b in 0 .. width as usize {
+                    data.push(bits[b]);
+                }
+            },
+            4 => {
+                let mut index = BitVec::with_capacity(data.len() + 1);
+                for b in bytes {
+                    if (b >> 4) > threshold {
+                        index.push(true);
+                    } else {
+                        index.push(false);
+                    }
+
+                    if (b & 0x0f) > threshold {
+                        index.push(true);
+                    } else {
+                        index.push(false);
+                    }
+                }
+                for i in 0 .. width as usize {
+                    data.push(index[i]);
+                }
+            },
+            8 => {
+                for index in bytes {
+                    if index > &threshold {
+                        data.push(true);
+                    } else {
+                        data.push(false);
+                    }
+                }
+            },
+            other => return Err(BmpError::new(Other,
+                format!("BMP does not support color palettes for {} bits per pixel", other)))
+        }
+    }
+    Ok(data)
+}
+
 fn read_pixels(bmp_data: &mut Cursor<Vec<u8>>, width: u32, height: u32,
                offset: u32, padding: i64) -> BmpResult<Vec<Pixel>> {
     let mut data = Vec::with_capacity((height * width) as usize);
@@ -666,6 +849,30 @@ fn read_pixels(bmp_data: &mut Cursor<Vec<u8>>, width: u32, height: u32,
         for _ in 0 .. width {
             try!(bmp_data.read(&mut px));
             data.push(px!(px[2], px[1], px[0]));
+        }
+        // seek padding
+        try!(bmp_data.seek(SeekFrom::Current(padding)));
+    }
+    Ok(data)
+}
+
+fn read_pixels_bitonal(bmp_data: &mut Cursor<Vec<u8>>, width: u32, height: u32,
+               offset: u32, padding: i64) -> BmpResult<BitVec> {
+    let threshold = 127;
+    let mut data = BitVec::with_capacity((height * width) as usize);
+    // seek until data
+    try!(bmp_data.seek(SeekFrom::Start(offset as u64)));
+    // read pixels until padding
+    let mut px = [0; 3];
+    for _ in 0 .. height {
+        for _ in 0 .. width {
+            try!(bmp_data.read(&mut px));
+
+            if (px[1] > threshold) {
+                data.push(true);
+            } else {
+                data.push(false);
+            }
         }
         // seek padding
         try!(bmp_data.seek(SeekFrom::Current(padding)));
